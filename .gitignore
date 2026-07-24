@@ -1,0 +1,42 @@
+# ── Secrets — NEVER commit the real .env ────────────────────────────────────
+.env
+.env.*
+
+# ── Python ──────────────────────────────────────────────────────────────────
+__pycache__/
+*.pyc
+*.pyo
+*.py[cod]
+*$py.class
+*.pyd
+*.so
+
+# ── Virtual environments ─────────────────────────────────────────────────────
+.venv/
+venv/
+env/
+ENV/
+
+# ── IDE / editor ────────────────────────────────────────────────────────────
+.idea/
+.vscode/
+*.swp
+*.swo
+.DS_Store
+Thumbs.db
+
+# ── Logs & Databases ─────────────────────────────────────────────────────────
+*.log
+logs/
+*.sqlite3
+
+# ── Distribution / build ─────────────────────────────────────────────────────
+dist/
+build/
+*.egg-info/
+*.egg
+
+# ── pytest / coverage ────────────────────────────────────────────────────────
+.pytest_cache/
+.coverage
+htmlcov/
