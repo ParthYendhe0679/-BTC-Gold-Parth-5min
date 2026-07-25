@@ -6,8 +6,8 @@ Every SCAN_INTERVAL seconds it:
   1. Loops through every configured asset
   2. Fetches latest candles ONCE per asset via Twelve Data REST API
   3. Dynamically filters out unclosed forming candles to evaluate strictly CLOSED bars
-  4. Loops through every configured strategy independently
-  5. Calculates Supertrend (ATR, HL2, Upper/Lower bands, direction) for each strategy
+  4. Loops through every configured strategy independently (Supertrend, EMA 5, etc.)
+  5. Calculates indicator values & signals for each strategy
   6. Checks for signal changes against previous closed-candle state
   7. Sends Telegram alerts strictly on confirmed trend crossovers
 
@@ -24,7 +24,13 @@ import pandas as pd
 from app.config import settings
 from app.data_fetcher import fetch_candles
 from app.models import Candle
-from app.strategy import calculate_supertrend, candles_to_dataframe, get_signal
+from app.strategy import (
+    calculate_ema_strategy,
+    calculate_supertrend,
+    candles_to_dataframe,
+    get_ema_signal,
+    get_signal,
+)
 from app.telegram import send_scanner_alert
 
 logger = logging.getLogger(__name__)
@@ -84,30 +90,47 @@ async def _check_strategy(
     """
     Run one strategy on completed closed candles for one asset.
 
-    Calculates ATR, HL2, Upper Band, Lower Band, Supertrend, Direction & Signal
-    independently for the strategy. Logs complete end-to-end audit trace.
+    Supports extensible strategy types (supertrend, ema, etc.).
+    Logs detailed execution trace matching exact format requirements.
     """
+    strategy_type = strategy.get("type", "supertrend")
     strategy_name = strategy["name"]
-    atr_period    = strategy["atr_period"]
-    multiplier    = strategy["multiplier"]
     state_key     = f"{symbol}::{strategy_name}"
 
-    min_bars = atr_period + 10
-    if len(df_closed) < min_bars:
-        logger.warning(
-            "%s [%s] — Only %d closed bars available; need %d. Skipping.",
-            asset_name, strategy_name, len(df_closed), min_bars,
-        )
+    indicator_val_str: Optional[str] = None
+
+    if strategy_type == "supertrend":
+        atr_period = strategy.get("atr_period", 10)
+        multiplier = strategy.get("multiplier", 3.0)
+        min_bars   = atr_period + 10
+        if len(df_closed) < min_bars:
+            logger.warning(
+                "%s [%s] — Only %d closed bars available; need %d. Skipping.",
+                asset_name, strategy_name, len(df_closed), min_bars,
+            )
+            return
+
+        df_strat = calculate_supertrend(df_closed, atr_period=atr_period, multiplier=multiplier)
+        info     = get_signal(df_strat)
+
+    elif strategy_type == "ema":
+        period   = strategy.get("period", 5)
+        min_bars = period + 2
+        if len(df_closed) < min_bars:
+            logger.warning(
+                "%s [%s] — Only %d closed bars available; need %d. Skipping.",
+                asset_name, strategy_name, len(df_closed), min_bars,
+            )
+            return
+
+        df_strat = calculate_ema_strategy(df_closed, period=period)
+        info     = get_ema_signal(df_strat)
+        if info:
+            indicator_val_str = f"{info['ema']:.2f}"
+    else:
+        logger.warning("%s — Unknown strategy type '%s'; skipping.", asset_name, strategy_type)
         return
 
-    # Calculate Supertrend independently for this strategy
-    df_strat = calculate_supertrend(
-        df_closed,
-        atr_period=atr_period,
-        multiplier=multiplier,
-    )
-
-    info = get_signal(df_strat)
     if info is None:
         logger.warning(
             "%s [%s] — Could not extract signal; skipping.", asset_name, strategy_name
@@ -120,73 +143,70 @@ async def _check_strategy(
     last_action    = _last_signals.get(state_key)
     alert_key      = f"{symbol}::{strategy_name}::{raw_time}"
 
-    # Log strategy snapshot
-    logger.info(
-        "%-10s [%s] | API Latest: %s | Evaluated: %s | Close: %.2f | ST: %.2f | Dir: %-7s | Signal: %s",
-        symbol,
-        strategy_name,
-        latest_api_candle_str,
-        raw_time,
-        current_price,
-        info["supertrend"],
-        info["direction_label"],
-        current_action,
-    )
+    # Required Console Audit Block
+    ind_metric_label = f"EMA({strategy.get('period', 5)})" if strategy_type == "ema" else "Supertrend"
+    ind_metric_val   = f"{info['ema']:.2f}" if strategy_type == "ema" else f"{info['supertrend']:.2f}"
+
+    prev_sig_display = last_action or "None"
+    changed_display  = "YES" if (last_action and current_action != last_action) else ("INITIALIZED" if last_action is None else "NO")
 
     # First Scan Initialization — record state baseline without sending alert
     if state_key not in _initialised:
         _last_signals[state_key] = current_action
         _sent_alerts.add(alert_key)
         _initialised.add(state_key)
-        logger.info(
-            "%s [%s] — Initial baseline set to %s @ %.2f (No Telegram call on first scan)",
-            symbol, strategy_name, current_action, current_price,
-        )
+
+        print("\n==============================")
+        print(f"Strategy : {strategy_name}")
+        print(f"Asset    : {symbol}")
+        print(f"Close    : {current_price:.2f}")
+        print(f"{ind_metric_label:<8} : {ind_metric_val}")
+        print(f"Direction: {info['direction_label']}")
+        print(f"Signal   : {current_action}")
+        print(f"Previous : None (Initialized)")
+        print(f"Changed? : INITIALIZED")
+        print(f"Telegram : NOT SENT (First Scan)")
+        print("==============================\n")
         return
+
+    telegram_status = "NOT SENT"
 
     if current_action != last_action:
         # Trend Crossover Detected!
         if alert_key in _sent_alerts:
-            logger.info(
-                "%s [%s] — Signal %s already sent for candle %s. Skipping.",
-                symbol, strategy_name, current_action, raw_time,
-            )
-            return
-
-        logger.info(
-            "🚨 SIGNAL CROSSOVER DETECTED — %s %s [%s] @ %.2f (was %s). Calling Telegram...",
-            current_action, symbol, strategy_name, current_price, last_action,
-        )
-
-        success = await loop.run_in_executor(
-            None,
-            lambda: send_scanner_alert(
-                asset_name=asset_name,
-                symbol=symbol,
-                action=current_action,
-                price=current_price,
-                raw_time=raw_time,
-                strategy_name=strategy_name,
-            ),
-        )
-
-        if success:
-            _last_signals[state_key] = current_action
-            _sent_alerts.add(alert_key)
-            logger.info(
-                "✅ Telegram API Response: SUCCESS (200 OK) — %s %s [%s]",
-                current_action, symbol, strategy_name,
-            )
+            telegram_status = "NOT SENT (Already Sent)"
         else:
-            logger.error(
-                "❌ Telegram API Response: FAILED — %s %s [%s] (will retry next scan)",
-                current_action, symbol, strategy_name,
+            success = await loop.run_in_executor(
+                None,
+                lambda: send_scanner_alert(
+                    asset_name=asset_name,
+                    symbol=symbol,
+                    action=current_action,
+                    price=current_price,
+                    raw_time=raw_time,
+                    strategy_name=strategy_name,
+                    indicator_val=indicator_val_str,
+                ),
             )
-    else:
-        logger.debug(
-            "%s [%s] — No signal change (%s == %s). Telegram not called.",
-            symbol, strategy_name, current_action, last_action,
-        )
+
+            if success:
+                _last_signals[state_key] = current_action
+                _sent_alerts.add(alert_key)
+                telegram_status = "SENT"
+            else:
+                telegram_status = "FAILED"
+
+    print("\n==============================")
+    print(f"Strategy : {strategy_name}")
+    print(f"Asset    : {symbol}")
+    print(f"Close    : {current_price:.2f}")
+    print(f"{ind_metric_label:<8} : {ind_metric_val}")
+    print(f"Direction: {info['direction_label']}")
+    print(f"Signal   : {current_action}")
+    print(f"Previous : {prev_sig_display}")
+    print(f"Changed? : {changed_display}")
+    print(f"Telegram : {telegram_status}")
+    print("==============================\n")
 
 
 # ─────────────────────────────────────────────────────────────────────────────

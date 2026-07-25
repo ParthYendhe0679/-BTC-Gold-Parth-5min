@@ -61,9 +61,9 @@ class Settings:
     # Add a new dict here to run an additional Supertrend variant.
     # The scanner loops over this list automatically — no code changes needed.
     STRATEGIES: List[Dict[str, Any]] = [
-        {"name": "Supertrend (10,3)", "atr_period": 10, "multiplier": 3.0},
-        {"name": "Supertrend (20,3)", "atr_period": 20, "multiplier": 3.0},
-        # {"name": "Supertrend (7,3)",  "atr_period":  7, "multiplier": 3.0},
+        {"type": "supertrend", "name": "Supertrend (10,3)", "atr_period": 10, "multiplier": 3.0},
+        {"type": "supertrend", "name": "Supertrend (20,3)", "atr_period": 20, "multiplier": 3.0},
+        {"type": "ema",        "name": "EMA 5",            "period": 5},
     ]
 
     def validate(self) -> None:

@@ -11,6 +11,7 @@ automatic retry with exponential back-off.
 
 import logging
 import time
+from typing import Optional
 
 import requests
 
@@ -136,6 +137,7 @@ def build_scanner_message(
     price: float,
     raw_time: str,
     strategy_name: str = "Supertrend (10,3)",
+    indicator_val: Optional[str] = None,
 ) -> str:
     """Build the Telegram message for a scanner-generated signal."""
     formatted_price = format_price(str(price))
@@ -150,12 +152,16 @@ def build_scanner_message(
             "🔴 *SELL SIGNAL*", "📉", "Bearish", "⚠️"
         )
 
+    indicator_line = f"{trend_icon} *Strategy*   : `{strategy_name}`\n\n"
+    if indicator_val:
+        indicator_line += f"📊 *EMA Value*  : `{indicator_val}`\n\n"
+
     return (
         f"{header}\n\n"
         f"{_DIVIDER}\n\n"
         f"🪙 *Asset*       : `{asset_name} ({symbol})`\n\n"
         f"⏱ *Timeframe* : `{settings.TIMEFRAME_DISPLAY}`\n\n"
-        f"{trend_icon} *Strategy*   : `{strategy_name}`\n\n"
+        f"{indicator_line}"
         f"💰 *Entry Price* : `{formatted_price}`\n\n"
         f"📊 *Trend*       : `{trend_label}`\n\n"
         f"🕒 *Signal Time* : `{signal_time}`\n\n"
@@ -172,6 +178,7 @@ def send_scanner_alert(
     price: float,
     raw_time: str,
     strategy_name: str = "Supertrend (10,3)",
+    indicator_val: Optional[str] = None,
 ) -> bool:
     """Send a Telegram notification for a scanner-detected signal change."""
     text = build_scanner_message(
@@ -181,6 +188,7 @@ def send_scanner_alert(
         price=price,
         raw_time=raw_time,
         strategy_name=strategy_name,
+        indicator_val=indicator_val,
     )
     return _send_raw(text)
 

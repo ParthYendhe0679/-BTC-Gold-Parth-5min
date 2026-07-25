@@ -1,15 +1,13 @@
 """
-strategy.py — Supertrend indicator calculation.
+strategy.py — Supertrend & EMA indicator strategy calculations.
 
-Implementation matches TradingView's Pine Script ta.supertrend() function:
-  • ATR computed via Wilder's RMA (EWM alpha = 1/period, no bias adjustment)
-  • Band adjustment uses the same look-back clamping logic as Pine Script
-  • Direction flip conditions are identical to Pine Script
+Implementation matches TradingView's Pine Script built-in functions:
+  • Supertrend: ta.supertrend() (ATR computed via Wilder's RMA)
+  • EMA       : ta.ema() (Exponential Moving Average)
 
 References
 ----------
-Pine Script source  : ta.supertrend() built-in
-TradingView article : https://www.tradingview.com/support/solutions/43000634738/
+TradingView Pine Script built-in functions documentation
 """
 
 import logging
@@ -59,9 +57,6 @@ def _wilder_atr(high: np.ndarray, low: np.ndarray, close: np.ndarray, period: in
 
     This exactly mirrors TradingView's `ta.atr(length)` which internally uses
     `ta.rma(ta.tr(true), length)`.
-
-    Seed: simple average of the first `period` True Range values.
-    Subsequent values: ATR[i] = (ATR[i-1] * (period-1) + TR[i]) / period
     """
     n = len(close)
 
@@ -100,22 +95,7 @@ def calculate_supertrend(
     multiplier: float = 3.0,
 ) -> pd.DataFrame:
     """
-    Add Supertrend columns to a price DataFrame.
-
-    Parameters
-    ----------
-    df         : DataFrame with columns [datetime, open, high, low, close]
-    atr_period : ATR lookback period (TradingView default: 10)
-    multiplier : Band multiplier     (TradingView default: 3.0)
-
-    Returns
-    -------
-    Copy of df with additional columns:
-        atr        – Wilder's ATR value
-        supertrend – Supertrend line value
-        direction  –  1 = Bullish  (price above supertrend → BUY zone)
-                     -1 = Bearish  (price below supertrend → SELL zone)
-                      0 = Not yet computed (warm-up bars)
+    Add Supertrend columns to a price DataFrame matching TradingView.
     """
     df = df.copy()
     n = len(df)
@@ -137,13 +117,11 @@ def calculate_supertrend(
     final_lower = basic_lower.copy()
 
     for i in range(1, n):
-        # Upper band tightens downward; resets if previous close broke above it
         if basic_upper[i] < final_upper[i - 1] or close[i - 1] > final_upper[i - 1]:
             final_upper[i] = basic_upper[i]
         else:
             final_upper[i] = final_upper[i - 1]
 
-        # Lower band tightens upward; resets if previous close broke below it
         if basic_lower[i] > final_lower[i - 1] or close[i - 1] < final_lower[i - 1]:
             final_lower[i] = basic_lower[i]
         else:
@@ -153,7 +131,6 @@ def calculate_supertrend(
     supertrend = np.zeros(n)
     direction  = np.zeros(n, dtype=int)   # 0 = warm-up
 
-    # First valid bar (end of ATR warm-up period)
     seed = atr_period - 1
     if seed >= n:
         df["atr"]        = atr
@@ -161,30 +138,22 @@ def calculate_supertrend(
         df["direction"]  = direction
         return df
 
-    # Seed assumes bearish (supertrend = upper band) — will self-correct within
-    # a few bars based on actual price action
     supertrend[seed] = final_upper[seed]
     direction[seed]  = -1
 
     for i in range(seed + 1, n):
         if direction[i - 1] == -1:
-            # ── Previously BEARISH ───────────────────────────────────────────
             if close[i] > final_upper[i]:
-                # Crosses above → turns BULLISH
                 direction[i]  = 1
                 supertrend[i] = final_lower[i]
             else:
-                # Remains BEARISH
                 direction[i]  = -1
                 supertrend[i] = final_upper[i]
         else:
-            # ── Previously BULLISH ───────────────────────────────────────────
             if close[i] < final_lower[i]:
-                # Drops below → turns BEARISH
                 direction[i]  = -1
                 supertrend[i] = final_upper[i]
             else:
-                # Remains BULLISH
                 direction[i]  = 1
                 supertrend[i] = final_lower[i]
 
@@ -196,27 +165,9 @@ def calculate_supertrend(
     return df
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# Signal extraction
-# ─────────────────────────────────────────────────────────────────────────────
-
 def get_signal(df: pd.DataFrame) -> Optional[dict]:
     """
     Extract the Supertrend signal & detailed indicator values from the last row of df.
-
-    Returns a dict with:
-      action          : "BUY" | "SELL"
-      price           : float (close price)
-      datetime        : str
-      open            : float
-      high            : float
-      low             : float
-      close           : float
-      atr             : float
-      upper_band      : float
-      lower_band      : float
-      supertrend      : float
-      direction_label : "Bullish" | "Bearish"
     """
     valid = df[df["direction"] != 0]
     if len(valid) < 2:
@@ -250,5 +201,76 @@ def get_signal(df: pd.DataFrame) -> Optional[dict]:
         "upper_band": up_band,
         "lower_band": low_band,
         "supertrend": st_val,
+        "direction_label": "Bullish" if direction == 1 else "Bearish",
+    }
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# EMA Strategy (Length = 5 default)
+# ─────────────────────────────────────────────────────────────────────────────
+
+def calculate_ema_strategy(
+    df: pd.DataFrame,
+    period: int = 5,
+) -> pd.DataFrame:
+    """
+    Add EMA indicator and direction columns to a price DataFrame.
+
+    Matches TradingView `ta.ema(close, period)`.
+
+    Direction logic:
+        1  (Bullish) = close > ema
+       -1  (Bearish) = close < ema
+    """
+    df = df.copy()
+    n = len(df)
+
+    close = df["close"].values.astype(float)
+    ema_series = pd.Series(close).ewm(span=period, adjust=False).mean().values
+
+    direction = np.zeros(n, dtype=int)
+
+    for i in range(1, n):
+        if close[i] > ema_series[i]:
+            direction[i] = 1   # Bullish (price above EMA)
+        elif close[i] < ema_series[i]:
+            direction[i] = -1  # Bearish (price below EMA)
+        else:
+            direction[i] = direction[i - 1]
+
+    df["ema"]       = ema_series
+    df["direction"] = direction
+    return df
+
+
+def get_ema_signal(df: pd.DataFrame) -> Optional[dict]:
+    """
+    Extract the EMA signal & detailed indicator values from the last row of df.
+    """
+    valid = df[df["direction"] != 0]
+    if len(valid) < 2:
+        logger.warning("Not enough valid bars to determine EMA signal.")
+        return None
+
+    latest    = valid.iloc[-1]
+    direction = int(latest["direction"])
+    price     = float(latest["close"])
+    dt_str    = str(latest["datetime"])
+    o_val     = float(latest["open"])
+    h_val     = float(latest["high"])
+    l_val     = float(latest["low"])
+    c_val     = float(latest["close"])
+    ema_val   = float(latest["ema"])
+
+    action = "BUY" if direction == 1 else "SELL"
+    return {
+        "action": action,
+        "price": price,
+        "datetime": dt_str,
+        "open": o_val,
+        "high": h_val,
+        "low": l_val,
+        "close": c_val,
+        "ema": ema_val,
         "direction_label": "Bullish" if direction == 1 else "Bearish",
     }
