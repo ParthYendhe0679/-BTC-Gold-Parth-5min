@@ -5,7 +5,7 @@ Runs as a background asyncio task inside the FastAPI process.
 Every SCAN_INTERVAL seconds it:
   1. Loops through every configured asset
   2. Fetches latest candles ONCE per asset via Twelve Data REST API
-  3. Evaluates Supertrend on completed closed candles
+  3. Dynamically filters out unclosed forming candles to evaluate strictly CLOSED bars
   4. Loops through every configured strategy independently
   5. Calculates Supertrend (ATR, HL2, Upper/Lower bands, direction) for each strategy
   6. Checks for signal changes against previous closed-candle state
@@ -50,8 +50,26 @@ def get_last_signals() -> Dict[str, Optional[str]]:
     return dict(_last_signals)
 
 
+def get_timeframe_delta(timeframe_str: str) -> pd.Timedelta:
+    """Parse timeframe string into a pandas Timedelta (e.g. '5min' -> 5 mins)."""
+    tf = timeframe_str.lower().strip()
+    if "min" in tf:
+        mins = int(tf.replace("minutes", "").replace("minute", "").replace("min", "").strip())
+        return pd.Timedelta(minutes=mins)
+    elif "m" in tf and not "min" in tf:
+        mins = int(tf.replace("m", "").strip())
+        return pd.Timedelta(minutes=mins)
+    elif "h" in tf:
+        hours = int(tf.replace("hours", "").replace("hour", "").replace("h", "").strip())
+        return pd.Timedelta(hours=hours)
+    elif "d" in tf:
+        days = int(tf.replace("days", "").replace("day", "").replace("d", "").strip())
+        return pd.Timedelta(days=days)
+    return pd.Timedelta(minutes=5)
+
+
 # ─────────────────────────────────────────────────────────────────────────────
-# Per-strategy signal check & status logging
+# Per-strategy signal check & detailed audit tracing
 # ─────────────────────────────────────────────────────────────────────────────
 
 async def _check_strategy(
@@ -59,6 +77,7 @@ async def _check_strategy(
     symbol: str,
     strategy: Dict[str, Any],
     df_closed: pd.DataFrame,
+    latest_api_candle_str: str,
     now_ist: datetime,
     loop: asyncio.AbstractEventLoop,
 ) -> None:
@@ -66,7 +85,7 @@ async def _check_strategy(
     Run one strategy on completed closed candles for one asset.
 
     Calculates ATR, HL2, Upper Band, Lower Band, Supertrend, Direction & Signal
-    independently for the strategy. Sends Telegram alert on new signal crossover.
+    independently for the strategy. Logs complete end-to-end audit trace.
     """
     strategy_name = strategy["name"]
     atr_period    = strategy["atr_period"]
@@ -103,9 +122,10 @@ async def _check_strategy(
 
     # Log strategy snapshot
     logger.info(
-        "%-10s [%s] | Bar: %s | Close: %.2f | ST: %.2f | Dir: %-7s | Signal: %s",
+        "%-10s [%s] | API Latest: %s | Evaluated: %s | Close: %.2f | ST: %.2f | Dir: %-7s | Signal: %s",
         symbol,
         strategy_name,
+        latest_api_candle_str,
         raw_time,
         current_price,
         info["supertrend"],
@@ -119,7 +139,7 @@ async def _check_strategy(
         _sent_alerts.add(alert_key)
         _initialised.add(state_key)
         logger.info(
-            "%s [%s] — Initial baseline set to %s @ %.2f",
+            "%s [%s] — Initial baseline set to %s @ %.2f (No Telegram call on first scan)",
             symbol, strategy_name, current_action, current_price,
         )
         return
@@ -134,7 +154,7 @@ async def _check_strategy(
             return
 
         logger.info(
-            "🚨 SIGNAL CROSSOVER — %s %s [%s] @ %.2f (was %s)",
+            "🚨 SIGNAL CROSSOVER DETECTED — %s %s [%s] @ %.2f (was %s). Calling Telegram...",
             current_action, symbol, strategy_name, current_price, last_action,
         )
 
@@ -154,23 +174,28 @@ async def _check_strategy(
             _last_signals[state_key] = current_action
             _sent_alerts.add(alert_key)
             logger.info(
-                "✅ Telegram Alert Sent — %s %s [%s]",
+                "✅ Telegram API Response: SUCCESS (200 OK) — %s %s [%s]",
                 current_action, symbol, strategy_name,
             )
         else:
             logger.error(
-                "❌ Telegram Failed — %s %s [%s] (will retry next scan)",
+                "❌ Telegram API Response: FAILED — %s %s [%s] (will retry next scan)",
                 current_action, symbol, strategy_name,
             )
+    else:
+        logger.debug(
+            "%s [%s] — No signal change (%s == %s). Telegram not called.",
+            symbol, strategy_name, current_action, last_action,
+        )
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Per-asset scan (fetch once, iterate strategies)
+# Per-asset scan (fetch once, filter closed candles, iterate strategies)
 # ─────────────────────────────────────────────────────────────────────────────
 
 async def _scan_asset(asset: Dict[str, Any], loop: asyncio.AbstractEventLoop) -> None:
     """
-    Scan one asset across ALL configured strategies using completed closed candles.
+    Scan one asset across ALL configured strategies using ONLY CLOSED candles.
     """
     name   = asset["name"]
     symbol = asset["symbol"]
@@ -195,8 +220,14 @@ async def _scan_asset(asset: Dict[str, Any], loop: asyncio.AbstractEventLoop) ->
     IST = timezone(timedelta(hours=5, minutes=30))
     now_ist = datetime.now(timezone.utc).astimezone(IST)
 
-    # All candles returned by Twelve Data REST API are completed closed bars
-    df_closed = df_base.copy()
+    # Dynamic Candle Close Verification — filter out forming unclosed candles
+    tf_delta = get_timeframe_delta(settings.TIMEFRAME)
+    latest_api_candle = df_base["datetime"].iloc[-1]
+    latest_api_candle_str = latest_api_candle.strftime("%Y-%m-%d %H:%M IST")
+
+    df_closed = df_base[df_base["datetime"] + tf_delta <= now_ist].copy()
+    if df_closed.empty:
+        df_closed = df_base.iloc[:-1].copy() if len(df_base) > 1 else df_base.copy()
 
     # Run each strategy on df_closed
     for strategy in settings.STRATEGIES:
@@ -206,6 +237,7 @@ async def _scan_asset(asset: Dict[str, Any], loop: asyncio.AbstractEventLoop) ->
                 symbol=symbol,
                 strategy=strategy,
                 df_closed=df_closed,
+                latest_api_candle_str=latest_api_candle_str,
                 now_ist=now_ist,
                 loop=loop,
             )
@@ -254,7 +286,7 @@ async def run_scanner() -> None:
                 now_ist.strftime("%Y-%m-%d %H:%M:%S"),
             )
 
-            # Each asset: fetch once, run all strategies
+            # Each asset: fetch once, filter closed candles, run all strategies
             for asset in settings.ASSETS:
                 try:
                     await _scan_asset(asset, loop)
