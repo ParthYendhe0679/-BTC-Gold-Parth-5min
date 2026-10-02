@@ -1,0 +1,14 @@
+Loaded data/twelvedata_XAUUSD_5m.csv: 20000 bars (2026-07-25 08:25:00+00:00 -> 2026-10-02 19:00:00+00:00), rejected malformed=0 inconsistent=0 dup=0, gaps=0
+strategy               trades   win%     exp%    PF     net%  maxDD% | TEST n     exp%    PF |  exp% 0x  exp% 2x
+SUPERTREND_10_3           440   35.7  -0.0068  0.95    -3.01    8.61 |     82  -0.0141  0.91 |   0.0132  -0.0268
+SUPERTREND_20_3           431   36.2   0.0064  1.04     2.75    5.64 |     76   0.0135  1.09 |   0.0264  -0.0136
+EMA5_CROSS               6676   14.4  -0.0225  0.49  -150.45  150.69 |   1366  -0.0246  0.43 |  -0.0025  -0.0425
+FIB_GOLDEN_ZONE           126   43.7  -0.0047  0.96     -0.6    3.52 |     25   -0.016  0.87 |   0.0153  -0.0247
+   -> optimised {'min_impulse_atr': 2.0, 'pivot_left': 5, 'min_rr': 1.5}: val t=0.32 test n=12 exp=-0.021 PF=0.83
+POS_5EMA                 1296   32.8   -0.023   0.7    -29.8   32.57 |    247  -0.0165  0.77 |   -0.003   -0.043
+   -> optimisation: no combination passed the train/validation gates
+RSI2_MEAN_REVERSION       618   40.8  -0.0249  0.45   -15.37   15.45 |    110   -0.016  0.58 |  -0.0049  -0.0449
+   -> optimisation: no combination passed the train/validation gates
+LIQUIDITY_SWEEP           586   34.0  -0.0302   0.6   -17.68   17.77 |    130  -0.0325  0.58 |  -0.0102  -0.0502
+   -> optimisation: no combination passed the train/validation gates
+Saved reports/backtest_XAUUSD_twelvedata.json
