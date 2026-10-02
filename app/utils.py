@@ -88,3 +88,46 @@ def normalize_timeframe(raw_timeframe: str) -> str:
         "1w":   "1 Week",
     }
     return mapping.get(raw_timeframe.lower(), raw_timeframe)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Secret redaction — never let tokens/keys reach logs or API responses
+# ─────────────────────────────────────────────────────────────────────────────
+
+_SECRET_PATTERNS = [
+    re.compile(r"(apikey=)[^&\s'\"]+", re.IGNORECASE),
+    re.compile(r"(/bot)\d+:[A-Za-z0-9_-]+"),
+    re.compile(r"(token=)[^&\s'\"]+", re.IGNORECASE),
+    re.compile(r"(secret=)[^&\s'\"]+", re.IGNORECASE),
+]
+
+
+def redact(text: object) -> str:
+    """Strip API keys / bot tokens from any string (exception messages include URLs)."""
+    from app.config import settings
+
+    out = str(text)
+    for pat in _SECRET_PATTERNS:
+        out = pat.sub(r"\1<redacted>", out)
+    for secret in (settings.TWELVE_DATA_API_KEY, settings.BOT_TOKEN,
+                   settings.WEBHOOK_SECRET, settings.ADMIN_TOKEN):
+        if secret and len(secret) >= 6:
+            out = out.replace(secret, "<redacted>")
+    return out[:500]
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Time helpers
+# ─────────────────────────────────────────────────────────────────────────────
+
+def utc_now() -> datetime:
+    return datetime.now(timezone.utc)
+
+
+def fmt_utc_ist(ts: datetime) -> str:
+    """'2026-10-03 10:05 UTC (15:35 IST)'."""
+    from datetime import timedelta
+
+    ist = timezone(timedelta(hours=5, minutes=30))
+    ts = ts if ts.tzinfo else ts.replace(tzinfo=timezone.utc)
+    return f"{ts.astimezone(timezone.utc):%Y-%m-%d %H:%M} UTC ({ts.astimezone(ist):%H:%M} IST)"

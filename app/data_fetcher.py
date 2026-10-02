@@ -2,29 +2,76 @@
 data_fetcher.py — Twelve Data REST API client.
 
 Fetches OHLCV candlestick data for any symbol supported by Twelve Data.
-Includes automatic retry with exponential back-off for transient failures.
 
-Twelve Data free-plan limits (as of 2024):
-  • 8 API requests / minute
-  • 800 API requests / day
+Twelve Data Basic (free) plan: 8 credits / minute, 800 credits / day,
+1 credit per time_series request. The scanner calls this once per asset per
+5-minute bar (2 × 288 = 576/day), with a daily budget guard for retries.
 
-With 2 assets scanned every 60 s → 2 req/min, 2,880 req/day.
-If you exceed the daily limit, consider reducing OUTPUT_SIZE or ASSETS count,
-or upgrading to a paid Twelve Data plan.
+Reliability rules:
+  • explicit ``timezone=UTC`` (the provider default is the exchange timezone)
+  • bounded timeouts; retries only for transient errors (timeouts, 5xx, 429)
+  • permanent errors (bad key/symbol, 4xx) are not retried
+  • secrets are redacted from every log line
 """
 
 import logging
+import threading
 import time
-from typing import List, Optional
+from datetime import date, datetime, timezone
+from typing import Any, Dict, List, Optional
 
 import requests
 
 from app.config import settings
 from app.models import Candle
+from app.utils import redact
 
 logger = logging.getLogger(__name__)
 
 _TIME_SERIES_URL = f"{settings.TWELVE_DATA_BASE_URL}/time_series"
+_session = requests.Session()
+
+
+class CreditTracker:
+    """Counts API credits used per UTC day (process-local)."""
+
+    def __init__(self) -> None:
+        self._lock = threading.Lock()
+        self.day: date = datetime.now(timezone.utc).date()
+        self.used = 0
+        self.provider_left: Optional[int] = None
+
+    def _roll(self) -> None:
+        today = datetime.now(timezone.utc).date()
+        if today != self.day:
+            self.day, self.used = today, 0
+
+    def add(self, n: int = 1) -> None:
+        with self._lock:
+            self._roll()
+            self.used += n
+
+    def remaining(self, budget: int) -> int:
+        with self._lock:
+            self._roll()
+            return budget - self.used
+
+
+credits = CreditTracker()
+
+# Last fetch outcome per symbol (for /health)
+fetch_status: Dict[str, Dict[str, Any]] = {}
+
+
+def _record(symbol: str, ok: bool, error: Optional[str] = None) -> None:
+    st = fetch_status.setdefault(symbol, {})
+    now = datetime.now(timezone.utc).isoformat()
+    if ok:
+        st["last_ok_at"] = now
+        st["last_error"] = None
+    else:
+        st["last_error_at"] = now
+        st["last_error"] = error
 
 
 def fetch_candles(
@@ -32,101 +79,84 @@ def fetch_candles(
     interval: str = "5min",
     outputsize: int = 150,
     max_retries: int = 3,
-    retry_delay: float = 5.0,
+    retry_delay: float = 2.0,
 ) -> Optional[List[Candle]]:
     """
     Fetch historical OHLCV candles from Twelve Data.
 
-    Parameters
-    ----------
-    symbol      : Twelve Data symbol, e.g. "BTC/USD", "XAU/USD", "EUR/USD"
-    interval    : Bar interval — "1min", "5min", "15min", "1h", "1day", etc.
-    outputsize  : Number of bars to fetch (max 5000 on paid plans, 500 on free)
-    max_retries : Maximum number of retry attempts on failure
-    retry_delay : Base delay in seconds between retries (multiplied by attempt#)
-
-    Returns
-    -------
-    List[Candle] sorted oldest → newest, or None if all retries fail.
+    Returns List[Candle] sorted oldest → newest (UTC open times), or None.
     """
     params = {
         "symbol":     symbol,
         "interval":   interval,
         "outputsize": outputsize,
+        "timezone":   "UTC",
+        "order":      "ASC",
         "apikey":     settings.TWELVE_DATA_API_KEY,
     }
 
     for attempt in range(1, max_retries + 1):
+        retryable = True
+        error = ""
         try:
-            headers = {"Cache-Control": "no-cache, no-store, must-revalidate", "Pragma": "no-cache"}
-            resp = requests.get(_TIME_SERIES_URL, params=params, headers=headers, timeout=15)
-            resp.raise_for_status()
-            data = resp.json()
+            credits.add(1)
+            resp = _session.get(_TIME_SERIES_URL, params=params, timeout=(5, 15))
+            left = resp.headers.get("api-credits-left")
+            if left is not None and str(left).isdigit():
+                credits.provider_left = int(left)
 
-            # ── API-level error (HTTP 200 but status == "error") ─────────────
-            if data.get("status") == "error":
-                code = data.get("code", "?")
-                msg  = data.get("message", "Unknown error")
-                logger.error(
-                    "Twelve Data API error for %s (code %s): %s", symbol, code, msg
-                )
-                # 429 = rate limit — wait longer before retrying
-                if str(code) == "429":
-                    time.sleep(retry_delay * attempt * 3)
-                elif attempt < max_retries:
-                    time.sleep(retry_delay * attempt)
-                continue
-
-            values = data.get("values")
-            if not values:
-                logger.warning("Empty response for %s — no 'values' key.", symbol)
-                return None
-
-            # ── Parse — API returns newest-first; we reverse to oldest-first ──
-            candles: List[Candle] = []
-            for row in reversed(values):
-                try:
-                    candles.append(
-                        Candle(
-                            datetime=row["datetime"],
-                            open=float(row["open"]),
-                            high=float(row["high"]),
-                            low=float(row["low"]),
-                            close=float(row["close"]),
-                            volume=float(row["volume"]) if row.get("volume") else None,
-                        )
-                    )
-                except (KeyError, ValueError, TypeError) as exc:
-                    logger.warning("Skipping malformed candle row: %s — %s", row, exc)
-
-            if not candles:
-                logger.warning("All rows were malformed for %s.", symbol)
-                return None
-
-            logger.debug("Fetched %d candles for %s", len(candles), symbol)
-            return candles
+            if resp.status_code == 429:
+                error = "HTTP 429 rate limited"
+            elif resp.status_code >= 500:
+                error = f"HTTP {resp.status_code}"
+            elif resp.status_code >= 400:
+                error, retryable = f"HTTP {resp.status_code}", False
+            else:
+                data = resp.json()
+                if data.get("status") == "error":
+                    code = str(data.get("code", "?"))
+                    error = f"API error {code}: {redact(data.get('message', ''))[:160]}"
+                    retryable = code in ("429",) or code.startswith("5")
+                else:
+                    values = data.get("values") or []
+                    if not values:
+                        _record(symbol, False, "empty response")
+                        logger.warning("Empty response for %s — no 'values'.", symbol)
+                        return None
+                    candles: List[Candle] = []
+                    for row in values:
+                        try:
+                            candles.append(Candle(
+                                datetime=row["datetime"],
+                                open=float(row["open"]),
+                                high=float(row["high"]),
+                                low=float(row["low"]),
+                                close=float(row["close"]),
+                                volume=float(row["volume"]) if row.get("volume") else None,
+                            ))
+                        except (KeyError, ValueError, TypeError) as exc:
+                            logger.warning("Skipping malformed candle row for %s: %s", symbol, exc)
+                    candles.sort(key=lambda c: c.datetime)
+                    _record(symbol, bool(candles), None if candles else "all rows malformed")
+                    return candles or None
 
         except requests.exceptions.Timeout:
-            logger.warning(
-                "Timeout fetching %s (attempt %d/%d)", symbol, attempt, max_retries
-            )
+            error = "timeout"
         except requests.exceptions.ConnectionError as exc:
-            logger.warning(
-                "Connection error for %s (attempt %d/%d): %s",
-                symbol, attempt, max_retries, exc,
-            )
-        except requests.exceptions.HTTPError as exc:
-            status = exc.response.status_code if exc.response else "?"
-            logger.warning(
-                "HTTP %s for %s (attempt %d/%d)", status, symbol, attempt, max_retries
-            )
+            error = f"connection error: {redact(exc)[:160]}"
+        except ValueError:
+            error = "invalid JSON"
         except Exception as exc:  # noqa: BLE001
-            logger.error("Unexpected error fetching %s: %s", symbol, exc)
+            error = f"unexpected: {redact(exc)[:160]}"
 
-        if attempt < max_retries:
-            sleep = retry_delay * attempt
-            logger.info("Retrying %s in %.0fs...", symbol, sleep)
-            time.sleep(sleep)
+        logger.warning("Twelve Data %s (attempt %d/%d): %s", symbol, attempt, max_retries, error)
+        _record(symbol, False, error)
+        if not retryable or attempt == max_retries:
+            break
+        sleep = min(retry_delay * (2 ** (attempt - 1)), 10.0)
+        if "429" in error:
+            sleep = 15.0   # per-minute limit window
+        time.sleep(sleep)
 
-    logger.error("All %d fetch attempts failed for %s.", max_retries, symbol)
+    logger.error("Fetch failed for %s: %s", symbol, fetch_status.get(symbol, {}).get("last_error"))
     return None

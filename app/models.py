@@ -30,6 +30,7 @@ class WebhookPayload(BaseModel):
     indicator: str
     entry: str
     time: str
+    secret: Optional[str] = None   # must equal WEBHOOK_SECRET when that is configured
 
     @field_validator("action", mode="before")
     @classmethod
@@ -39,7 +40,7 @@ class WebhookPayload(BaseModel):
     @field_validator("symbol", "timeframe", "indicator", "entry", "time", mode="before")
     @classmethod
     def strip_whitespace(cls, v: str) -> str:
-        return v.strip()
+        return str(v).strip()
 
 
 class WebhookSuccessResponse(BaseModel):
@@ -57,6 +58,7 @@ class WebhookErrorResponse(BaseModel):
 class HealthResponse(BaseModel):
     status: str = "running"
     project: str = "BTC/Gold-Parth 5min"
+    health: str = "/health"
 
 
 # ── Scanner internal data models ─────────────────────────────────────────────

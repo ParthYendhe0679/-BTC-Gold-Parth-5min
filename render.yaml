@@ -1,31 +1,40 @@
 # render.yaml — Render deployment configuration
 # https://render.com/docs/yaml-spec
+#
+# NOTE: the live service may have been created in the dashboard rather than from
+# this Blueprint; in that case Render ignores this file — apply the same
+# settings (health check path, env vars) in the dashboard.
 
 services:
   - type: web
     name: btc-trading-alert-bot
     runtime: python
-    region: singapore        # closest to most Asian traders; change as needed
-    plan: free               # upgrade to starter/standard for production SLAs
+    region: singapore
+    # FREE PLAN LIMITATION: free web services spin down after 15 minutes with no
+    # inbound HTTP traffic, and the in-process scanner stops with them. For
+    # 24/7 signals use a paid instance (e.g. plan: starter). See README.
+    plan: free
 
-    # Build step — install all pinned dependencies
     buildCommand: pip install -r requirements.txt
+    # Single worker on purpose — the scanner runs inside the process; more
+    # workers would mean duplicate scanners.
+    startCommand: uvicorn app.main:app --host 0.0.0.0 --port $PORT --workers 1
 
-    # Start command — Render injects $PORT automatically
-    startCommand: uvicorn app.main:app --host 0.0.0.0 --port $PORT
-
-    # Health-check path — Render polls this to confirm the service is up
-    healthCheckPath: /
-
-    # Auto-deploy on every push to the linked Git branch
+    # /health returns 503 only if the scanner task is dead or stalled, so Render
+    # restarts it; provider outages report "degraded" with 200.
+    healthCheckPath: /health
     autoDeploy: true
 
-    # Environment variables — add BOT_TOKEN and CHAT_ID in the Render dashboard
-    # (do NOT hardcode secrets here)
     envVars:
+      - key: TWELVE_DATA_API_KEY
+        sync: false
       - key: BOT_TOKEN
-        sync: false          # managed via Render dashboard / secret files
+        sync: false
       - key: CHAT_ID
+        sync: false
+      - key: WEBHOOK_SECRET
+        sync: false
+      - key: ADMIN_TOKEN
         sync: false
       - key: PYTHON_VERSION
         value: "3.12"
