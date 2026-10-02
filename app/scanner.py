@@ -2,326 +2,290 @@
 scanner.py — Autonomous multi-asset, multi-strategy signal scanner.
 
 Runs as a background asyncio task inside the FastAPI process.
-Every SCAN_INTERVAL seconds it:
-  1. Loops through every configured asset
-  2. Fetches latest candles ONCE per asset via Twelve Data REST API
-  3. Dynamically filters out unclosed forming candles to evaluate strictly CLOSED bars
-  4. Loops through every configured strategy independently (Supertrend, EMA 5, etc.)
-  5. Calculates indicator values & signals for each strategy
-  6. Checks for signal changes against previous closed-candle state
-  7. Sends Telegram alerts strictly on confirmed trend crossovers
 
-State key format:  "<symbol>::<strategy_name>"
+Lifecycle per 5-minute bar (aligned to the candle close):
+  1. Wake SCAN_DELAY_SECONDS after the bar boundary (no overlapping scans — lock).
+  2. Per asset (concurrently, isolated): fetch candles ONCE (Twelve Data, UTC).
+  3. Validate: only CLOSED, well-formed, de-duplicated, non-future bars survive.
+     If the just-closed bar is missing (provider lag) → one bounded refetch,
+     only when the daily credit budget allows it.
+  4. If no new closed candle since the last evaluation → nothing to do.
+  5. Run every enabled strategy on the shared data + indicator cache.
+  6. Keep signals on candles newer than each strategy's cursor; claim them in
+     SQLite (dedup); stale ones (> MAX_SIGNAL_AGE_SECONDS) are logged, not sent.
+  7. Enqueue for the delivery worker → Telegram immediately (scan never waits
+     on Telegram). Delivery status + latency are recorded.
+
+Startup baseline: a strategy with no stored cursor records the latest closed
+candle WITHOUT alerting (same as the original "first scan initialisation"),
+so a restart never re-sends an old signal.
 """
 
 import asyncio
 import logging
 from datetime import datetime, timedelta, timezone
-from typing import Any, Dict, List, Optional
+from typing import Any, Callable, Dict, List, Optional
 
 import pandas as pd
 
+from app.candles import expected_latest_closed_open, validate_candles
 from app.config import settings
-from app.data_fetcher import fetch_candles
-from app.models import Candle
-from app.strategy import (
-    calculate_ema_strategy,
-    calculate_supertrend,
-    candles_to_dataframe,
-    get_ema_signal,
-    get_signal,
-)
-from app.telegram import send_scanner_alert
+from app.data_fetcher import credits, fetch_candles
+from app.state import StateStore
+from app.strategies import (MarketContext, Signal, Strategy, annotate_agreement,
+                            build_strategies, evaluate_all)
+from app.telegram import format_signal_message, send_text
+from app.utils import redact, utc_now
 
 logger = logging.getLogger(__name__)
 
-# ─────────────────────────────────────────────────────────────────────────────
-# In-memory signal state
-# ─────────────────────────────────────────────────────────────────────────────
+TF = pd.Timedelta(minutes=settings.TIMEFRAME_MINUTES)
 
-_last_signals: Dict[str, Optional[str]] = {}
-_initialised: set = set()
-_sent_alerts: set = set()
-
-# Health snapshot — exposed via GET /scanner/status
+# Health snapshot — exposed via /health and /scanner/status
 scanner_state: Dict[str, Any] = {
     "running": False,
+    "started_at": None,
     "scan_count": 0,
+    "last_loop_at": None,
+    "last_scan_started_at": None,
+    "last_successful_scan_at": None,
     "last_scan_ist": None,
+    "last_error": None,
+    "assets": {},          # symbol → {latest_closed_candle, validation, skipped_reason, ...}
+    "strategies": {},      # "symbol::strategy_id" → {status, last_signal, error}
 }
 
 
-def get_last_signals() -> Dict[str, Optional[str]]:
-    """Return a copy of the current signal state (for the status endpoint)."""
-    return dict(_last_signals)
+def market_open(asset: Dict[str, Any], now: datetime) -> bool:
+    """Coarse weekend filter for FX/metals (saves API credits). Crypto is 24/7."""
+    if asset.get("market") != "fx":
+        return True
+    wd, hr = now.weekday(), now.hour      # Mon=0 … Sat=5, Sun=6
+    if wd == 5 or (wd == 6 and hr < 21):
+        return False
+    return True
 
 
-def get_timeframe_delta(timeframe_str: str) -> pd.Timedelta:
-    """Parse timeframe string into a pandas Timedelta (e.g. '5min' -> 5 mins)."""
-    tf = timeframe_str.lower().strip()
-    if "min" in tf:
-        mins = int(tf.replace("minutes", "").replace("minute", "").replace("min", "").strip())
-        return pd.Timedelta(minutes=mins)
-    elif "m" in tf and not "min" in tf:
-        mins = int(tf.replace("m", "").strip())
-        return pd.Timedelta(minutes=mins)
-    elif "h" in tf:
-        hours = int(tf.replace("hours", "").replace("hour", "").replace("h", "").strip())
-        return pd.Timedelta(hours=hours)
-    elif "d" in tf:
-        days = int(tf.replace("days", "").replace("day", "").replace("d", "").strip())
-        return pd.Timedelta(days=days)
-    return pd.Timedelta(minutes=5)
+def next_run_time(now: datetime, delay_s: int, tf_minutes: int) -> datetime:
+    tf_s = tf_minutes * 60
+    epoch = now.timestamp()
+    boundary = (epoch // tf_s) * tf_s + delay_s
+    if boundary <= epoch:
+        boundary += tf_s
+    return datetime.fromtimestamp(boundary, tz=timezone.utc)
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# Per-strategy signal check & detailed audit tracing
-# ─────────────────────────────────────────────────────────────────────────────
+class Scanner:
+    def __init__(
+        self,
+        store: StateStore,
+        strategies: List[Strategy],
+        assets: Optional[List[Dict[str, Any]]] = None,
+        fetch: Callable[..., Any] = fetch_candles,
+        sender: Callable[[str], Any] = send_text,
+        now_fn: Callable[[], datetime] = utc_now,
+    ) -> None:
+        self.store = store
+        self.strategies = strategies
+        self.assets = assets if assets is not None else settings.ASSETS
+        self.fetch = fetch
+        self.sender = sender
+        self.now = now_fn
+        self.queue: "asyncio.Queue" = asyncio.Queue()
+        self.lock = asyncio.Lock()
+        self.last_evaluated: Dict[str, pd.Timestamp] = {}
 
-async def _check_strategy(
-    asset_name: str,
-    symbol: str,
-    strategy: Dict[str, Any],
-    df_closed: pd.DataFrame,
-    latest_api_candle_str: str,
-    now_ist: datetime,
-    loop: asyncio.AbstractEventLoop,
-) -> None:
-    """
-    Run one strategy on completed closed candles for one asset.
+    # ── scanning ─────────────────────────────────────────────────────────────
+    async def _fetch_validated(self, symbol: str):
+        candles = await asyncio.to_thread(self.fetch, symbol=symbol, interval=settings.TIMEFRAME,
+                                          outputsize=settings.OUTPUT_SIZE)
+        if not candles:
+            return None, None
+        return validate_candles(candles, TF, self.now())
 
-    Supports extensible strategy types (supertrend, ema, etc.).
-    Logs detailed execution trace matching exact format requirements.
-    """
-    strategy_type = strategy.get("type", "supertrend")
-    strategy_name = strategy["name"]
-    state_key     = f"{symbol}::{strategy_name}"
+    def _retry_budget_ok(self) -> bool:
+        now = self.now()
+        bars_left = int((24 * 60 - (now.hour * 60 + now.minute)) / settings.TIMEFRAME_MINUTES)
+        planned = bars_left * len(self.assets)
+        return credits.remaining(settings.DAILY_CREDIT_BUDGET) - planned > 0
 
-    indicator_val_str: Optional[str] = None
+    async def scan_asset(self, asset: Dict[str, Any]) -> List[Signal]:
+        symbol = asset["symbol"]
+        st = scanner_state["assets"].setdefault(symbol, {})
+        now = self.now()
+        if not market_open(asset, now):
+            st["skipped_reason"] = "market closed (weekend)"
+            return []
+        st["skipped_reason"] = None
 
-    if strategy_type == "supertrend":
-        atr_period = strategy.get("atr_period", 10)
-        multiplier = strategy.get("multiplier", 3.0)
-        min_bars   = atr_period + 10
-        if len(df_closed) < min_bars:
-            logger.warning(
-                "%s [%s] — Only %d closed bars available; need %d. Skipping.",
-                asset_name, strategy_name, len(df_closed), min_bars,
-            )
-            return
+        df, rep = await self._fetch_validated(symbol)
+        expected = expected_latest_closed_open(now, TF)
+        if rep is not None and (rep.latest_closed_open is None or rep.latest_closed_open < expected) \
+                and self._retry_budget_ok():
+            logger.info("%s: latest closed bar %s < expected %s — refetching once in %ds",
+                        symbol, rep.latest_closed_open, expected, settings.STALE_RETRY_SECONDS)
+            await asyncio.sleep(settings.STALE_RETRY_SECONDS)
+            df2, rep2 = await self._fetch_validated(symbol)
+            if rep2 is not None:
+                df, rep = df2, rep2
+        if df is None or df.empty:
+            st["last_error"] = "no valid candles"
+            logger.warning("%s: no valid closed candles this cycle.", symbol)
+            return []
 
-        df_strat = calculate_supertrend(df_closed, atr_period=atr_period, multiplier=multiplier)
-        info     = get_signal(df_strat)
+        latest = rep.latest_closed_open
+        st.update(latest_closed_candle=latest.isoformat(), validation=rep.as_dict(),
+                  last_fetch_at=now.isoformat(), last_error=None)
+        if self.last_evaluated.get(symbol) == latest:
+            logger.info("%s: no new closed candle (latest %s) — strategies not re-run.", symbol, latest)
+            return []
+        self.last_evaluated[symbol] = latest
 
-    elif strategy_type == "ema":
-        period   = strategy.get("period", 5)
-        min_bars = period + 2
-        if len(df_closed) < min_bars:
-            logger.warning(
-                "%s [%s] — Only %d closed bars available; need %d. Skipping.",
-                asset_name, strategy_name, len(df_closed), min_bars,
-            )
-            return
+        ctx = MarketContext(symbol, df, settings.TIMEFRAME, TF)
+        results = evaluate_all(ctx, self.strategies)
+        fresh: List[Signal] = []
+        for res in results:
+            key = f"{symbol}::{res.strategy_id}"
+            sstate = scanner_state["strategies"].setdefault(key, {})
+            sstate.update(status=res.status, error=res.error, evaluated_candle=latest.isoformat())
+            if res.status == "ERROR":
+                continue   # cursor not advanced → retried next bar (within freshness)
+            cursor = self.store.get_cursor(symbol, res.strategy_id)
+            self.store.set_cursor(symbol, res.strategy_id, latest.isoformat())
+            if cursor is None:
+                logger.info("%s [%s]: baseline at %s (no alert on startup).", symbol, res.strategy_id, latest)
+                continue
+            cur_ts = pd.Timestamp(cursor)
+            for sig in res.signals:
+                if sig.candle_time <= cur_ts:
+                    continue
+                age = (now - (sig.candle_time + TF).to_pydatetime()).total_seconds()
+                d = sig.to_dict()
+                if age > settings.MAX_SIGNAL_AGE_SECONDS:
+                    self.store.claim_signal(d, status="STALE_SKIPPED")
+                    logger.warning("%s [%s] %s signal on %s is %.0fs old — logged, not sent.",
+                                   symbol, sig.strategy_id, sig.direction, sig.candle_time, age)
+                    continue
+                if self.store.claim_signal(d):
+                    fresh.append(sig)
+                    sstate["last_signal"] = {"direction": sig.direction, "candle": sig.candle_time.isoformat(),
+                                             "signal_id": sig.signal_id}
+                else:
+                    logger.info("Duplicate suppressed: %s %s %s", sig.strategy_id, symbol, sig.setup_key)
+        annotate_agreement(fresh)
+        for sig in fresh:
+            logger.info("SIGNAL %s %s %s @ %.5f (candle %s) id=%s", sig.strategy_id, symbol, sig.direction,
+                        sig.entry, sig.candle_time, sig.signal_id)
+            await self.queue.put((sig, asset.get("decimals", 2), datetime.now(timezone.utc)))
+        logger.info("%s: evaluated candle %s — %s", symbol, latest,
+                    ", ".join(f"{r.strategy_id}={r.status}" for r in results))
+        return fresh
 
-        df_strat = calculate_ema_strategy(df_closed, period=period)
-        info     = get_ema_signal(df_strat)
-        if info:
-            indicator_val_str = f"{info['ema']:.2f}"
-    else:
-        logger.warning("%s — Unknown strategy type '%s'; skipping.", asset_name, strategy_type)
-        return
-
-    if info is None:
-        logger.warning(
-            "%s [%s] — Could not extract signal; skipping.", asset_name, strategy_name
-        )
-        return
-
-    current_action = info["action"]
-    current_price  = info["price"]
-    raw_time       = info["datetime"]
-    last_action    = _last_signals.get(state_key)
-    alert_key      = f"{symbol}::{strategy_name}::{raw_time}"
-
-    # Required Console Audit Block
-    ind_metric_label = f"EMA({strategy.get('period', 5)})" if strategy_type == "ema" else "Supertrend"
-    ind_metric_val   = f"{info['ema']:.2f}" if strategy_type == "ema" else f"{info['supertrend']:.2f}"
-
-    prev_sig_display = last_action or "None"
-    changed_display  = "YES" if (last_action and current_action != last_action) else ("INITIALIZED" if last_action is None else "NO")
-
-    # First Scan Initialization — record state baseline without sending alert
-    if state_key not in _initialised:
-        _last_signals[state_key] = current_action
-        _sent_alerts.add(alert_key)
-        _initialised.add(state_key)
-
-        print("\n==============================")
-        print(f"Strategy : {strategy_name}")
-        print(f"Asset    : {symbol}")
-        print(f"Close    : {current_price:.2f}")
-        print(f"{ind_metric_label:<8} : {ind_metric_val}")
-        print(f"Direction: {info['direction_label']}")
-        print(f"Signal   : {current_action}")
-        print(f"Previous : None (Initialized)")
-        print(f"Changed? : INITIALIZED")
-        print(f"Telegram : NOT SENT (First Scan)")
-        print("==============================\n")
-        return
-
-    telegram_status = "NOT SENT"
-
-    if current_action != last_action:
-        # Trend Crossover Detected!
-        if alert_key in _sent_alerts:
-            telegram_status = "NOT SENT (Already Sent)"
-        else:
-            success = await loop.run_in_executor(
-                None,
-                lambda: send_scanner_alert(
-                    asset_name=asset_name,
-                    symbol=symbol,
-                    action=current_action,
-                    price=current_price,
-                    raw_time=raw_time,
-                    strategy_name=strategy_name,
-                    indicator_val=indicator_val_str,
-                ),
-            )
-
-            if success:
-                _last_signals[state_key] = current_action
-                _sent_alerts.add(alert_key)
-                telegram_status = "SENT"
-            else:
-                telegram_status = "FAILED"
-
-    print("\n==============================")
-    print(f"Strategy : {strategy_name}")
-    print(f"Asset    : {symbol}")
-    print(f"Close    : {current_price:.2f}")
-    print(f"{ind_metric_label:<8} : {ind_metric_val}")
-    print(f"Direction: {info['direction_label']}")
-    print(f"Signal   : {current_action}")
-    print(f"Previous : {prev_sig_display}")
-    print(f"Changed? : {changed_display}")
-    print(f"Telegram : {telegram_status}")
-    print("==============================\n")
-
-
-# ─────────────────────────────────────────────────────────────────────────────
-# Per-asset scan (fetch once, filter closed candles, iterate strategies)
-# ─────────────────────────────────────────────────────────────────────────────
-
-async def _scan_asset(asset: Dict[str, Any], loop: asyncio.AbstractEventLoop) -> None:
-    """
-    Scan one asset across ALL configured strategies using ONLY CLOSED candles.
-    """
-    name   = asset["name"]
-    symbol = asset["symbol"]
-
-    # Fetch candles (blocking I/O → thread pool)
-    candles: Optional[List[Candle]] = await loop.run_in_executor(
-        None,
-        lambda: fetch_candles(
-            symbol=symbol,
-            interval=settings.TIMEFRAME,
-            outputsize=settings.OUTPUT_SIZE,
-        ),
-    )
-
-    if not candles:
-        logger.warning("No candles returned for %s — skipping this cycle.", name)
-        return
-
-    # Convert to DataFrame (datetimes are converted to IST timezone)
-    df_base = candles_to_dataframe(candles)
-
-    IST = timezone(timedelta(hours=5, minutes=30))
-    now_ist = datetime.now(timezone.utc).astimezone(IST)
-
-    # Dynamic Candle Close Verification — filter out forming unclosed candles
-    tf_delta = get_timeframe_delta(settings.TIMEFRAME)
-    latest_api_candle = df_base["datetime"].iloc[-1]
-    latest_api_candle_str = latest_api_candle.strftime("%Y-%m-%d %H:%M IST")
-
-    df_closed = df_base[df_base["datetime"] + tf_delta <= now_ist].copy()
-    if df_closed.empty:
-        df_closed = df_base.iloc[:-1].copy() if len(df_base) > 1 else df_base.copy()
-
-    # Run each strategy on df_closed
-    for strategy in settings.STRATEGIES:
-        try:
-            await _check_strategy(
-                asset_name=name,
-                symbol=symbol,
-                strategy=strategy,
-                df_closed=df_closed,
-                latest_api_candle_str=latest_api_candle_str,
-                now_ist=now_ist,
-                loop=loop,
-            )
-        except asyncio.CancelledError:
-            raise
-        except Exception as exc:  # noqa: BLE001
-            logger.exception(
-                "%s [%s] — Unexpected error: %s",
-                name, strategy.get("name", "?"), exc,
-            )
-
-
-# ─────────────────────────────────────────────────────────────────────────────
-# Main scanner loop
-# ─────────────────────────────────────────────────────────────────────────────
-
-async def run_scanner() -> None:
-    """
-    Infinite scan loop. Started as an asyncio background task by main.py.
-    """
-    scanner_state["running"] = True
-
-    strategy_names = ", ".join(s["name"] for s in settings.STRATEGIES)
-    asset_names    = ", ".join(f"{a['name']} ({a['symbol']})" for a in settings.ASSETS)
-
-    logger.info("=" * 60)
-    logger.info("BTC/Gold-Parth 5min — Scanner Started")
-    logger.info("Assets     : %s", asset_names)
-    logger.info("Strategies : %s", strategy_names)
-    logger.info("Timeframe  : %s", settings.TIMEFRAME_DISPLAY)
-    logger.info("Interval   : %d seconds", settings.SCAN_INTERVAL)
-    logger.info("=" * 60)
-
-    loop = asyncio.get_event_loop()
-
-    try:
-        while True:
-            IST = timezone(timedelta(hours=5, minutes=30))
-            now_ist = datetime.now(timezone.utc).astimezone(IST)
+    async def scan_once(self) -> List[Signal]:
+        if self.lock.locked():
+            logger.warning("Previous scan still running — skipping this cycle.")
+            return []
+        async with self.lock:
+            now = self.now()
             scanner_state["scan_count"] += 1
-            scanner_state["last_scan_ist"] = now_ist.isoformat()
+            scanner_state["last_scan_started_at"] = now.isoformat()
+            scanner_state["last_scan_ist"] = now.astimezone(timezone(timedelta(hours=5, minutes=30))).isoformat()
+            results = await asyncio.gather(*(self.scan_asset(a) for a in self.assets), return_exceptions=True)
+            signals: List[Signal] = []
+            ok = False
+            for asset, r in zip(self.assets, results):
+                if isinstance(r, BaseException):
+                    if isinstance(r, asyncio.CancelledError):
+                        raise r
+                    msg = redact(f"{asset['symbol']}: {type(r).__name__}: {r}")
+                    scanner_state["last_error"] = msg
+                    logger.error("Scan error %s", msg, exc_info=r)
+                else:
+                    signals += r
+                    ok = True
+            if ok:
+                scanner_state["last_successful_scan_at"] = self.now().isoformat()
+            return signals
 
-            logger.info(
-                "--- Scan #%d  |  %s IST ---",
-                scanner_state["scan_count"],
-                now_ist.strftime("%Y-%m-%d %H:%M:%S"),
-            )
+    # ── delivery ─────────────────────────────────────────────────────────────
+    async def delivery_worker(self) -> None:
+        while True:
+            sig, decimals, generated_at = await self.queue.get()
+            try:
+                text = format_signal_message(sig, decimals, settings.TIMEFRAME_MINUTES)
+                res = await asyncio.to_thread(self.sender, text)
+                done = datetime.now(timezone.utc)
+                close = (sig.candle_time + TF).to_pydatetime()
+                latency_ms = int((done - close).total_seconds() * 1000)
+                gen_ms = int((done - generated_at).total_seconds() * 1000)
+                self.store.update_delivery(sig.signal_id, res.status, res.attempts, res.error,
+                                           res.message_id, latency_ms)
+                logger.info("Telegram %s for %s (attempts=%d, candle-close→sent=%dms, generated→sent=%dms)",
+                            res.status, sig.signal_id, res.attempts, latency_ms, gen_ms)
+            except Exception as exc:  # noqa: BLE001
+                logger.exception("Delivery failed for %s", sig.signal_id)
+                self.store.update_delivery(sig.signal_id, "FAILED", 0, redact(exc), None, None)
+            finally:
+                self.queue.task_done()
+            await asyncio.sleep(settings.TELEGRAM_MIN_SEND_INTERVAL)
 
-            # Each asset: fetch once, filter closed candles, run all strategies
-            for asset in settings.ASSETS:
+    # ── main loop ────────────────────────────────────────────────────────────
+    async def run_forever(self) -> None:
+        worker = asyncio.create_task(self.delivery_worker(), name="telegram_delivery")
+        try:
+            while True:
+                scanner_state["last_loop_at"] = self.now().isoformat()
                 try:
-                    await _scan_asset(asset, loop)
-                    # Brief pause between assets to respect API rate limits
-                    await asyncio.sleep(3)
+                    await asyncio.wait_for(self.scan_once(), timeout=240)
+                except asyncio.TimeoutError:
+                    scanner_state["last_error"] = "scan timed out after 240s"
+                    logger.error("Scan timed out.")
                 except asyncio.CancelledError:
                     raise
                 except Exception as exc:  # noqa: BLE001
-                    logger.exception(
-                        "Unexpected error scanning %s: %s", asset["name"], exc
-                    )
+                    scanner_state["last_error"] = redact(exc)
+                    logger.exception("Scan cycle failed")
+                nxt = next_run_time(self.now(), settings.SCAN_DELAY_SECONDS, settings.TIMEFRAME_MINUTES)
+                wait = max(1.0, (nxt - self.now()).total_seconds())
+                scanner_state["next_scan_at"] = nxt.isoformat()
+                logger.info("Next scan at %s UTC (in %.0fs).", nxt.strftime("%H:%M:%S"), wait)
+                await asyncio.sleep(wait)
+        finally:
+            worker.cancel()
 
-            logger.info("Waiting %d Seconds...", settings.SCAN_INTERVAL)
-            await asyncio.sleep(settings.SCAN_INTERVAL)
 
-    except asyncio.CancelledError:
+_scanner: Optional[Scanner] = None
+
+
+def get_scanner() -> Optional[Scanner]:
+    return _scanner
+
+
+def get_last_signals() -> Dict[str, Any]:
+    """Return last signal per symbol::strategy (for the status endpoint)."""
+    return {k: v.get("last_signal") for k, v in scanner_state["strategies"].items()}
+
+
+async def run_scanner() -> None:
+    """Background entry point started by main.py's lifespan. One instance per process."""
+    global _scanner
+    if scanner_state["running"]:
+        logger.warning("Scanner already running in this process — not starting a second one.")
+        return
+    store = StateStore(settings.STATE_DB_PATH)
+    strategies = build_strategies(settings.enabled_strategies)
+    _scanner = Scanner(store, strategies)
+    scanner_state["running"] = True
+    scanner_state["started_at"] = utc_now().isoformat()
+    logger.info("=" * 60)
+    logger.info("BTC/Gold-Parth 5min v%s — Scanner Started", settings.APP_VERSION)
+    logger.info("Assets     : %s", ", ".join(a["symbol"] for a in settings.ASSETS))
+    logger.info("Strategies : %s", ", ".join(s.id for s in strategies))
+    logger.info("Schedule   : every %d min, %ds after candle close", settings.TIMEFRAME_MINUTES,
+                settings.SCAN_DELAY_SECONDS)
+    logger.info("=" * 60)
+    try:
+        await _scanner.run_forever()
+    finally:
         scanner_state["running"] = False
-        logger.info("Scanner stopped cleanly.")
+        logger.info("Scanner stopped.")
